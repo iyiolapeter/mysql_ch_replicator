@@ -1513,7 +1513,11 @@ class MysqlToClickhouseConverter:
         structure.charset_python = 'utf-8'
 
         if structure.charset:
-            structure.charset_python = CHARSET_MYSQL_TO_PYTHON[structure.charset]
+            # MySQL charset identifiers are case-insensitive (e.g. a CREATE may
+            # declare CHARSET=UTF8), but CHARSET_MYSQL_TO_PYTHON is keyed by the
+            # lowercase canonical names. Normalise before lookup so an uppercase
+            # charset doesn't raise KeyError and crash-loop the replicator.
+            structure.charset_python = CHARSET_MYSQL_TO_PYTHON[structure.charset.lower()]
 
         prev_line = ''
         for line in inner_tokens:
