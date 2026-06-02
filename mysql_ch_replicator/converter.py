@@ -1448,14 +1448,23 @@ class MysqlToClickhouseConverter:
         tokens = [t for t in tokens if not t.is_whitespace and not t.is_newline]
 
         # remove "IF NOT EXISTS"
-        if (len(tokens) > 5 and
+        # sqlparse < 0.5.4 emits IF / NOT / EXISTS as three separate Keyword
+        # tokens. sqlparse >= 0.5.4 merges them into one Keyword token whose
+        # normalized value is the literal string "IF NOT EXISTS". Honour
+        # both shapes so the parser works under whichever sqlparse version
+        # pip happens to resolve (pyproject pins `sqlparse >= 0.5.1`).
+        if (len(tokens) > 3 and
                 tokens[0].normalized.upper() == 'CREATE' and
-                tokens[1].normalized.upper() == 'TABLE' and
-                tokens[2].normalized.upper() == 'IF' and
-                tokens[3].normalized.upper() == 'NOT' and
-                tokens[4].normalized.upper() == 'EXISTS'):
-            del tokens[2:5]  # Remove the 'IF', 'NOT', 'EXISTS' tokens
-            structure.if_not_exists = True
+                tokens[1].normalized.upper() == 'TABLE'):
+            if (len(tokens) > 5 and
+                    tokens[2].normalized.upper() == 'IF' and
+                    tokens[3].normalized.upper() == 'NOT' and
+                    tokens[4].normalized.upper() == 'EXISTS'):
+                del tokens[2:5]  # Remove the 'IF', 'NOT', 'EXISTS' tokens (old shape)
+                structure.if_not_exists = True
+            elif tokens[2].normalized.upper() == 'IF NOT EXISTS':
+                del tokens[2]  # Remove the merged 'IF NOT EXISTS' token (new shape)
+                structure.if_not_exists = True
 
         if tokens[0].ttype != sqlparse.tokens.DDL:
             raise Exception('wrong create statement', create_statement)
