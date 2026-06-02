@@ -1314,10 +1314,21 @@ class MysqlToClickhouseConverter:
             if char == "'":
                 result.append(char)
                 i += 1
-                # Copy the entire string literal, handling escaped quotes
+                # Copy the entire string literal, handling escaped quotes.
+                # Two escape forms recognised: SQL-standard doubled ('')
+                # AND MySQL/Sequelize backslash (\'). Without the latter,
+                # comments like 'Watcher\'s name' get cut short at the
+                # backslash-apostrophe and downstream parsing breaks.
                 while i < len(create_statement):
                     char = create_statement[i]
                     result.append(char)
+                    if char == '\\' and i + 1 < len(create_statement):
+                        # Escape sequence: pass through the next char verbatim
+                        # without treating it as a potential string terminator.
+                        i += 1
+                        result.append(create_statement[i])
+                        i += 1
+                        continue
                     if char == "'":
                         # Check if this is an escaped quote (doubled)
                         if i + 1 < len(create_statement) and create_statement[i + 1] == "'":
@@ -1328,15 +1339,20 @@ class MysqlToClickhouseConverter:
                             break
                     i += 1
                 continue
-            
+
             # Handle string literals (double quotes)
             if char == '"':
                 result.append(char)
                 i += 1
-                # Copy the entire string literal, handling escaped quotes
+                # Same dual-escape handling as the single-quote branch above.
                 while i < len(create_statement):
                     char = create_statement[i]
                     result.append(char)
+                    if char == '\\' and i + 1 < len(create_statement):
+                        i += 1
+                        result.append(create_statement[i])
+                        i += 1
+                        continue
                     if char == '"':
                         # Check if this is an escaped quote (doubled)
                         if i + 1 < len(create_statement) and create_statement[i + 1] == '"':
@@ -1388,8 +1404,15 @@ class MysqlToClickhouseConverter:
                     quote_char = create_statement[j]
                     j += 1  # Skip opening quote
                     
-                    # Find the closing quote, handling escaped quotes
+                    # Find the closing quote, honoring both escape forms:
+                    # SQL-standard doubled (e.g. 'it''s') AND MySQL backslash
+                    # (e.g. 'it\'s'). MySQL/Sequelize emit the latter by default,
+                    # and the previous version of this loop terminated early
+                    # on the inner apostrophe, corrupting downstream parsing.
                     while j < len(create_statement):
+                        if create_statement[j] == '\\' and j + 1 < len(create_statement):
+                            j += 2  # Skip backslash + next char (escape sequence)
+                            continue
                         if create_statement[j] == quote_char:
                             # Check if this is an escaped quote (doubled)
                             if j + 1 < len(create_statement) and create_statement[j + 1] == quote_char:
