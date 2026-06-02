@@ -1534,6 +1534,14 @@ class MysqlToClickhouseConverter:
                 continue
             if line.lower().startswith('spatial'):
                 continue
+            # Standalone FOREIGN KEY (without a CONSTRAINT prefix) — emitted by
+            # Sequelize and other ORMs whenever the migration declares an FK
+            # but doesn't name the constraint. Without this skip, the column
+            # parser interprets "FOREIGN KEY (col) REFERENCES …" as a column
+            # named "FOREIGN" with type "KEY", raising
+            # 'unknown mysql type "key"' downstream in convert_type.
+            if line.lower().startswith('foreign key'):
+                continue
             # Handle unnamed UNIQUE constraints like "UNIQUE (uuid)" or "UNIQUE(uuid)"
             # This must be checked after other unique key checks to avoid false positives
             # We check if "unique" is followed by optional whitespace and then "("
