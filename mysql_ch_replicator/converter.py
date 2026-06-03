@@ -674,7 +674,11 @@ class MysqlToClickhouseConverter:
         mysql_query = mysql_query.strip()
         if mysql_query.endswith(';'):
             mysql_query = mysql_query[:-1]
-        if mysql_query.find(';') != -1:
+        # Detect genuine multi-statement queries while ignoring semicolons that
+        # appear inside string literals (e.g. a column COMMENT containing ';').
+        # A naive `;` search false-positives on such comments and crash-loops
+        # the replicator on an otherwise valid single ALTER/CREATE statement.
+        if len(split_high_level(mysql_query, ';')) > 1:
             raise Exception('multi-query statement not supported')
         return mysql_query
     
