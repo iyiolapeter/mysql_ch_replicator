@@ -549,6 +549,14 @@ class MysqlToClickhouseConverter:
         clickhouse_structure.if_not_exists = mysql_structure.if_not_exists
         for field in mysql_structure.fields:
             clickhouse_field_type = self.convert_field_type(field.field_type, field.parameters)
+            # PRIMARY KEY columns are implicitly NOT NULL in MySQL even when the
+            # binlog CREATE omits "NOT NULL" (SHOW CREATE TABLE renders it, the
+            # executed statement may not). The field params therefore lack
+            # "not null" and convert_field_type wraps the type in Nullable(...).
+            # ClickHouse forbids Nullable columns in ORDER BY / PARTITION keys
+            # (which are built from the primary key), so unwrap for PK columns.
+            if field.name in mysql_structure.primary_keys and clickhouse_field_type.startswith('Nullable('):
+                clickhouse_field_type = clickhouse_field_type[len('Nullable('):-1]
             clickhouse_structure.fields.append(TableField(
                 name=field.name,
                 field_type=clickhouse_field_type,
