@@ -60,7 +60,12 @@ class DbOptimizer:
         ch_databases = set(self.clickhouse_api.get_databases())
 
         for db in databases:
-            if db not in ch_databases:
+            # The ClickHouse database may be renamed via target_databases, so
+            # check the TARGET name against ClickHouse — not the MySQL source
+            # name. Without this, a renamed target DB never matches and the
+            # optimizer silently no-ops (tables are never OPTIMIZEd).
+            target_db = self.config.target_databases.get(db, db)
+            if target_db not in ch_databases:
                 continue
             last_process_time = self.state.last_process_time.get(db, 0.0)
             if time.time() - last_process_time < self.config.optimize_interval:
@@ -68,32 +73,39 @@ class DbOptimizer:
             return db
         return None
 
-    def optimize_table(self, db_name, table_name):
-        logger.info(f'Optimizing table {db_name}.{table_name}')
+    def optimize_table(self, ch_db_name, ch_table_name):
+        # Names here are ClickHouse-side (target) names, already mapped by the caller.
+        logger.info(f'Optimizing table {ch_db_name}.{ch_table_name}')
         t1 = time.time()
         on_cluster = self.clickhouse_api.get_on_cluster_clause()
         optimize_final = 'FINAL' if self.config.enable_optimize_final else ''
         self.clickhouse_api.execute_command(
-            f'OPTIMIZE TABLE `{db_name}`.`{table_name}` {on_cluster} {optimize_final}  SETTINGS mutations_sync = 2, alter_sync = 2'
+            f'OPTIMIZE TABLE `{ch_db_name}`.`{ch_table_name}` {on_cluster} {optimize_final}  SETTINGS mutations_sync = 2, alter_sync = 2'
         )
         t2 = time.time()
         logger.info(f'Optimize finished in {int(t2-t1)} seconds')
 
     def optimize_database(self, db_name):
+        # db_name is the MySQL SOURCE database. Tables are listed from MySQL, but
+        # every ClickHouse operation must use the (possibly renamed) target
+        # database and target table names — see target_databases / target_tables.
+        target_db = self.config.target_databases.get(db_name, db_name)
+
         self.mysql_api.set_database(db_name)
         tables = self.mysql_api.get_tables()
         self.mysql_api.close()
         tables = [table for table in tables if self.config.is_table_matches(table)]
-    
+
         # todo: we should not be doing this and instead should have function just like we have "set_database" in mysql_api
         # https://github.com/bakwc/mysql_ch_replicator/issues/225
-        self.clickhouse_api.execute_command(f'USE `{db_name}`')
+        self.clickhouse_api.execute_command(f'USE `{target_db}`')
         ch_tables = set(self.clickhouse_api.get_tables())
 
         for table in tables:
-            if table not in ch_tables:
+            target_table = self.config.get_target_table_name(db_name, table)
+            if target_table not in ch_tables:
                 continue
-            self.optimize_table(db_name, table)
+            self.optimize_table(target_db, target_table)
         self.state.last_process_time[db_name] = time.time()
         self.state.save()
 
