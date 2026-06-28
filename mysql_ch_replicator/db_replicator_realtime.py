@@ -207,7 +207,18 @@ class DbReplicatorRealtime:
         self.replicator.state.tables_structure[mysql_structure.table_name] = (mysql_structure, ch_structure)
         indexes = self.replicator.config.get_indexes(self.replicator.database, mysql_structure.table_name)
         partition_bys = self.replicator.config.get_partition_bys(self.replicator.database, mysql_structure.table_name)
-        self.replicator.clickhouse_api.create_table(ch_structure, additional_indexes=indexes, additional_partition_bys=partition_bys)
+        # Apply configured custom ORDER BY too — the initial-replication path
+        # (create_initial_structure_table) passes additional_order_bys, but the
+        # realtime CREATE handler omitted it, so a table created via a binlog
+        # CREATE event silently got ORDER BY = primary key instead of the
+        # configured order_bys. Keep the two paths consistent.
+        order_bys = self.replicator.config.get_order_bys(self.replicator.database, mysql_structure.table_name)
+        self.replicator.clickhouse_api.create_table(
+            ch_structure,
+            additional_indexes=indexes,
+            additional_partition_bys=partition_bys,
+            additional_order_bys=order_bys,
+        )
 
     def handle_drop_table_query(self, query, db_name):
         tokens = query.split()
