@@ -745,6 +745,17 @@ class MysqlToClickhouseConverter:
             op_name = tokens[0].lower()
             tokens = tokens[1:]
 
+            # MySQL online-DDL hints ("ALGORITHM=INSTANT", "LOCK=NONE") are
+            # appended as comma-separated clauses and mean nothing to ClickHouse.
+            # split_high_level turns each into its own subquery; skip them (and any
+            # empty / option-only subquery) so they don't crash the parser
+            # mid-ALTER — which would leave the ALTER half-applied and trigger a
+            # DUPLICATE_COLUMN replay loop.
+            if op_name.startswith('algorithm') or op_name.startswith('lock'):
+                continue
+            if not tokens:
+                continue
+
             if tokens[0].lower() == 'column':
                 tokens = tokens[1:]
 
@@ -888,6 +899,13 @@ class MysqlToClickhouseConverter:
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
 
+            # Idempotent ADD COLUMN: if the column already exists (e.g. this ALTER
+            # is replayed after a crash/restart before its binlog position was
+            # committed), skip re-adding it — to both the in-memory structure and
+            # ClickHouse — to avoid a DUPLICATE_COLUMN crash-loop on DDL replay.
+            if ch_table_structure.has_field(column_name):
+                return
+
             if column_first:
                 mysql_table_structure.add_field_first(
                     TableField(name=column_name, field_type=column_type_mysql)
@@ -912,7 +930,7 @@ class MysqlToClickhouseConverter:
 
         target_table_name = self.db_replicator.get_target_table_name(table_name) if self.db_replicator else table_name
         on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause() if self.db_replicator else ''
-        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} ADD COLUMN `{column_name}` {column_type_ch}'
+        query = f'ALTER TABLE `{db_name}`.`{target_table_name}` {on_cluster} ADD COLUMN IF NOT EXISTS `{column_name}` {column_type_ch}'
         if column_first:
             query += ' FIRST'
         else:
