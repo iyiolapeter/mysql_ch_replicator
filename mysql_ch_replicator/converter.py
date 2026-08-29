@@ -760,10 +760,10 @@ class MysqlToClickhouseConverter:
                 tokens = tokens[1:]
 
             if op_name == 'add':
-                if tokens[0].lower() in ('constraint', 'index', 'foreign', 'unique', 'key'):
+                if tokens[0].lower() in ('constraint', 'index', 'foreign', 'unique', 'key', 'check', 'primary'):
                     continue
                 # Handle cases where keywords are combined with parentheses: INDEX(col), CONSTRAINT(name), etc.
-                for keyword in ('constraint', 'index', 'foreign', 'unique', 'key'):
+                for keyword in ('constraint', 'index', 'foreign', 'unique', 'key', 'check', 'primary'):
                     if tokens[0].lower().startswith(f'{keyword}('):
                         break
                 else:
@@ -771,10 +771,10 @@ class MysqlToClickhouseConverter:
                 continue
 
             if op_name == 'drop':
-                if tokens[0].lower() in ('constraint', 'index', 'foreign', 'unique', 'key'):
+                if tokens[0].lower() in ('constraint', 'index', 'foreign', 'unique', 'key', 'check', 'primary'):
                     continue
                 # Handle cases where keywords are combined with parentheses: INDEX(col), CONSTRAINT(name), etc.
-                for keyword in ('constraint', 'index', 'foreign', 'unique', 'key'):
+                for keyword in ('constraint', 'index', 'foreign', 'unique', 'key', 'check', 'primary'):
                     if tokens[0].lower().startswith(f'{keyword}('):
                         break
                 else:
