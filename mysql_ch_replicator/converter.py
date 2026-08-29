@@ -397,15 +397,20 @@ class MysqlToClickhouseConverter:
         if mysql_type == 'multipolygon':
             return 'Array(Array(Tuple(x Float32, y Float32)))'
 
-        # Correctly handle numeric types
-        if mysql_type.startswith('numeric'):
+        # Correctly handle numeric/decimal types. DECIMAL and NUMERIC are MySQL
+        # synonyms; both map to ClickHouse Decimal(p, s). Mapping a bare
+        # `decimal` to Float64 (an earlier fallback below) silently loses
+        # precision on money columns whenever a decimal(p, s) precision appears
+        # that isn't listed in the config types_mapping (e.g. a widening from
+        # decimal(19,4) to decimal(19,8)).
+        if mysql_type.startswith('numeric') or mysql_type.startswith('decimal'):
             # Determine if parameters are specified via parentheses:
             if '(' in mysql_type and ')' in mysql_type:
                 # Expecting a type definition like "numeric(precision, scale)"
-                pattern = r"numeric\((\d+)\s*,\s*(\d+)\)"
+                pattern = r"(?:numeric|decimal)\((\d+)\s*,\s*(\d+)\)"
                 match = re.search(pattern, mysql_type)
                 if not match:
-                    raise ValueError(f"Invalid numeric type definition: {mysql_type}")
+                    raise ValueError(f"Invalid numeric/decimal type definition: {mysql_type}")
 
                 precision = int(match.group(1))
                 scale = int(match.group(2))
