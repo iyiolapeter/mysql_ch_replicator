@@ -965,7 +965,55 @@ class MysqlToClickhouseConverter:
         if self.db_replicator:
             self.db_replicator.clickhouse_api.execute_command(query)
 
+    def _merge_ch_enum(self, current_ch_type, new_ch_type):
+        """Reconcile a ClickHouse ENUM type change so it doesn't renumber
+        existing elements.
+
+        ClickHouse stores an enum as the element's integer; a MODIFY that
+        changes the integer of an existing element is rejected (code 70,
+        CANNOT_CONVERT_TYPE) because it would silently reinterpret stored rows.
+        MySQL, by contrast, renumbers positionally when a value is inserted
+        mid-list. Because enum VALUES are replicated as their string label (see
+        EnumConverter), ClickHouse's internal numbering is free to differ from
+        MySQL's — so we keep every existing element->number assignment and
+        append only genuinely-new labels with fresh numbers. Non-enum types (and
+        cases where either side isn't an enum) pass through unchanged.
+        """
+        def unwrap(t):
+            if t.startswith('Nullable(') and t.endswith(')'):
+                return t[9:-1], True
+            return t, False
+
+        cur, _ = unwrap(current_ch_type)
+        new, new_null = unwrap(new_ch_type)
+        if not (cur.startswith('Enum') and new.startswith('Enum')):
+            return new_ch_type
+
+        pair_re = re.compile(r"'((?:[^'\\]|\\.|'')*)'\s*=\s*(-?\d+)")
+        current_pairs = pair_re.findall(cur)
+        new_pairs = pair_re.findall(new)
+        if not current_pairs or not new_pairs:
+            return new_ch_type
+
+        mapping = {name: int(num) for name, num in current_pairs}
+        next_num = max(mapping.values()) + 1
+        for name, _num in new_pairs:
+            if name not in mapping:
+                mapping[name] = next_num
+                next_num += 1
+
+        items = sorted(mapping.items(), key=lambda kv: kv[1])
+        body = ', '.join(f"'{name}' = {num}" for name, num in items)
+        enum_kw = 'Enum16' if len(items) > 127 else 'Enum8'
+        merged = f'{enum_kw}({body})'
+        return f'Nullable({merged})' if new_null else merged
+
     def __convert_alter_table_modify_column(self, db_name, table_name, tokens):
+        # Re-tokenize so a parenthesized type with internal spaces — e.g.
+        # ENUM('a', 'b') or DECIMAL(19, 8) — stays a single token instead of
+        # being fragmented by the caller's raw whitespace split (which would
+        # hand convert_type a truncated "enum('a'," and crash the enum parser).
+        tokens = self._tokenize_alter_query(' '.join(tokens))
         if len(tokens) < 2:
             raise Exception('wrong tokens count', tokens)
 
@@ -980,6 +1028,12 @@ class MysqlToClickhouseConverter:
             table_structure = self.db_replicator.state.tables_structure[table_name]
             mysql_table_structure: TableStructure = table_structure[0]
             ch_table_structure: TableStructure = table_structure[1]
+
+            # Preserve existing ClickHouse enum element numbers (see _merge_ch_enum):
+            # a MODIFY that renumbers an existing enum element is rejected by CH.
+            existing_field = ch_table_structure.get_field(column_name)
+            if existing_field is not None:
+                column_type_ch = self._merge_ch_enum(existing_field.field_type, column_type_ch)
 
             mysql_table_structure.update_field(
                 TableField(name=column_name, field_type=column_type_mysql),
@@ -1136,8 +1190,14 @@ class MysqlToClickhouseConverter:
 
         column_name = strip_sql_name(tokens[0])
         new_column_name = strip_sql_name(tokens[1])
-        column_type_mysql = tokens[2]
-        column_type_mysql_parameters = ' '.join(tokens[3:])
+        # The type may contain spaces inside parentheses — ENUM('a', 'b'),
+        # DECIMAL(19, 8) — which the caller's raw whitespace split fragments.
+        # Re-tokenize only the remainder (after the two column names) so the
+        # parenthesized type stays a single token. (Re-tokenizing the whole
+        # CHANGE body would instead glue the new name onto the type.)
+        rest_tokens = self._tokenize_alter_query(' '.join(tokens[2:]))
+        column_type_mysql = rest_tokens[0]
+        column_type_mysql_parameters = ' '.join(rest_tokens[1:])
 
         column_type_ch = self.convert_field_type(column_type_mysql, column_type_mysql_parameters)
 
@@ -1150,6 +1210,10 @@ class MysqlToClickhouseConverter:
             current_column_type_ch = ch_table_structure.get_field(column_name).field_type
             target_table_name = self.db_replicator.get_target_table_name(table_name)
             on_cluster = self.db_replicator.clickhouse_api.get_on_cluster_clause()
+
+            # Preserve existing ClickHouse enum element numbers (see _merge_ch_enum):
+            # a MODIFY that renumbers an existing enum element is rejected by CH.
+            column_type_ch = self._merge_ch_enum(current_column_type_ch, column_type_ch)
 
             if current_column_type_ch != column_type_ch:
 
