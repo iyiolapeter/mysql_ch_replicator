@@ -113,6 +113,8 @@ def run_db_replicator(args, config: Settings):
         table=args.table,
         initial_replication_test_fail_records=getattr(args, 'initial_replication_test_fail_records', None),
         skip_initial_replication=args.skip_initial_replication,
+        target_table=getattr(args, 'target_table', None),
+        fixed_version=getattr(args, 'fixed_version', None),
     )
     db_replicator.run()
 
@@ -191,6 +193,14 @@ def main():
     parser.add_argument(
         "--skip_initial_replication", action="store_true",
         help="Skip initial replication and start realtime replication directly",
+    )
+    parser.add_argument(
+        "--target_table", type=str, default=None,
+        help="(rebootstrap worker) write the rows of --table into this ClickHouse table instead",
+    )
+    parser.add_argument(
+        "--fixed_version", type=int, default=None,
+        help="(rebootstrap worker) stamp every inserted row with this exact _version",
     )
     args = parser.parse_args()
 

@@ -10,6 +10,7 @@ from logging import getLogger
 from .config import Settings
 from .mysql_api import MySQLApi
 from .utils import ProcessRunner, GracefulKiller
+from .control import ControlChannel
 
 from . import db_replicator
 
@@ -81,6 +82,15 @@ class Runner:
         config = Config(app=app, host=self.config.http_host, port=self.config.http_port)
         self.router = APIRouter()
         self.router.add_api_route("/restart_replication", self.restart_replication, methods=["GET"])
+        # Live per-table control (handled by the db_replicator child through the
+        # file-based ControlChannel in its data directory):
+        #   skip / unskip   - stop / resume applying a table's DML without a restart
+        #   rebootstrap     - rebuild one table from MySQL while everything else keeps replicating
+        self.router.add_api_route("/db/{db_name}/status", self.control_status, methods=["GET"])
+        self.router.add_api_route("/db/{db_name}/skip/{table_name}", self.control_skip, methods=["POST"])
+        self.router.add_api_route("/db/{db_name}/unskip/{table_name}", self.control_unskip, methods=["POST"])
+        self.router.add_api_route("/db/{db_name}/rebootstrap/abort", self.control_abort_rebootstrap, methods=["POST"])
+        self.router.add_api_route("/db/{db_name}/rebootstrap/{table_name}", self.control_rebootstrap, methods=["POST"])
         app.include_router(self.router)
 
         self.http_server = Server(config)
@@ -93,6 +103,24 @@ class Runner:
             logger.info('waiting replication restarted..')
             time.sleep(1)
         return {"restarted": True}
+
+    def _control(self, db_name: str) -> ControlChannel:
+        return ControlChannel(os.path.join(self.config.binlog_replicator.data_dir, db_name))
+
+    def control_status(self, db_name: str):
+        return self._control(db_name).read_status()
+
+    def control_skip(self, db_name: str, table_name: str):
+        return self._control(db_name).submit('skip', table=table_name)
+
+    def control_unskip(self, db_name: str, table_name: str):
+        return self._control(db_name).submit('unskip', table=table_name)
+
+    def control_rebootstrap(self, db_name: str, table_name: str):
+        return self._control(db_name).submit('rebootstrap', table=table_name)
+
+    def control_abort_rebootstrap(self, db_name: str):
+        return self._control(db_name).submit('abort_rebootstrap')
 
     def is_initial_replication_finished(self, db_name):
         state_path = os.path.join(

@@ -412,6 +412,32 @@ Please note:
 
 In case of a failure or during the initial replication, `mysql_ch_replicator` will preserve old data and continue syncing new data seamlessly. You could remove the state and restart replication from scratch.
 
+#### Live Per-Table Control (skip / rebootstrap)
+
+Sometimes one table needs attention while every other table must keep replicating - for example a bulk `DELETE` in MySQL that ClickHouse can only apply as thousands of slow mutations, leaving replication hours behind. Restarting or re-running the whole initial replication is a poor fit: the former re-seeks the binlog cache, the latter rebuilds the entire database.
+
+With `http_host`/`http_port` configured, the runner exposes per-table controls that take effect in the running `db_replicator` **without a restart**:
+
+```
+GET  /db/<db>/status                       # skipped tables, mirrors, rebootstrap progress, last error
+POST /db/<db>/skip/<table>                 # stop applying the table's DML (events are read and dropped)
+POST /db/<db>/unskip/<table>               # resume applying DML (the skipped window stays missing)
+POST /db/<db>/rebootstrap/<table>          # rebuild the table from MySQL, live
+POST /db/<db>/rebootstrap/abort            # cancel an in-progress rebootstrap
+```
+
+- **skip** lets the replicator race through a backlog it cannot afford to apply for one table while all other tables stay current. DDL still applies (query events are not table-scoped), only DML is withheld - so the table's data is stale until it is rebuilt.
+- **rebootstrap** rebuilds a single table in place: a shadow table `<table>__rb` is created with the configured `ORDER BY` / `PARTITION BY` / indexes, realtime writes for the table are *mirrored* into it while bulk-load workers copy the current MySQL rows (`initial_replication_threads` workers), deletes that raced the load are reconciled, and the shadow is swapped in atomically with `EXCHANGE TABLES` (requires an `Atomic` database, the ClickHouse default). The live table keeps being updated throughout, so an abort - or a crash, which aborts on restart - never loses data; just re-run.
+- Snapshot rows carry `_version = 1` and mirrored realtime rows use the live counter, so under `ReplacingMergeTree` a realtime write always wins over a stale snapshot row. If a DDL for the table is seen during the load the rebootstrap aborts (the snapshot structure could be stale) - re-run it.
+
+Typical use for a delete storm on `big_table`:
+
+```bash
+curl -X POST http://127.0.0.1:9128/db/mydb/skip/big_table          # other tables catch up in minutes
+curl -X POST http://127.0.0.1:9128/db/mydb/rebootstrap/big_table   # rebuild it from current MySQL state
+curl      http://127.0.0.1:9128/db/mydb/status                     # watch "rebootstrap.in_progress"
+```
+
 ## Production usage
 
 Here is the checklist for production. Please read it carefully and confirm every point. If you have any questions - feel free to ask in discussion / issues. Following the checklist is critical to avoid any issues on prod.

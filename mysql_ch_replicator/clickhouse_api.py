@@ -300,8 +300,19 @@ class ClickhouseApi:
             logger.debug(f'create table query: {query}')
             self.execute_command(query)
 
-    def insert(self, table_name, records, table_structure: TableStructure = None):
-        current_version = self.get_last_used_version(table_name) + 1
+    def insert(self, table_name, records, table_structure: TableStructure = None,
+               version_key: str | None = None, fixed_version: int | None = None):
+        # version_key: which table's version counter to draw from. Defaults to
+        # table_name. A live-table rebootstrap mirrors realtime writes into a
+        # shadow table and passes version_key=<live table> so the mirrored rows
+        # keep the live (high) counter instead of starting a fresh one.
+        # fixed_version: stamp every row with this exact _version and leave the
+        # counters untouched. Snapshot rows of a rebootstrap use fixed_version=1
+        # so that any realtime row (high counter) wins under ReplacingMergeTree.
+        version_key = version_key or table_name
+        current_version = None
+        if fixed_version is None:
+            current_version = self.get_last_used_version(version_key) + 1
 
         records_to_insert = []
         for record in records:
@@ -331,8 +342,11 @@ class ClickhouseApi:
                 new_record.append(e)
             record = new_record
 
-            records_to_insert.append(tuple(record) + (current_version,))
-            current_version += 1
+            if fixed_version is not None:
+                records_to_insert.append(tuple(record) + (fixed_version,))
+            else:
+                records_to_insert.append(tuple(record) + (current_version,))
+                current_version += 1
 
         # in cluster mode we want to insert data to distributed so that its replicated among other shards & replicas
         if self.clickhouse_settings.cluster:
@@ -363,7 +377,8 @@ class ClickhouseApi:
             records=len(records_to_insert),
         )
 
-        self.set_last_used_version(table_name, current_version)
+        if fixed_version is None:
+            self.set_last_used_version(version_key, current_version)
 
     def erase(self, table_name, field_name, field_values):
         field_name = ','.join(field_name)
@@ -413,6 +428,25 @@ class ClickhouseApi:
         query = f'DROP TABLE IF EXISTS `{self.database}`.`{table_name}` {on_cluster}'
         logger.debug(query)
         self.execute_command(query)
+
+    def exchange_tables(self, table_a, table_b):
+        """Atomically swap two tables (requires an Atomic database engine,
+        the ClickHouse default). Used by the live single-table rebootstrap to
+        replace a table with its freshly loaded shadow in one step."""
+        on_cluster = self.get_on_cluster_clause()
+        query = f'EXCHANGE TABLES `{self.database}`.`{table_a}` AND `{self.database}`.`{table_b}` {on_cluster}'
+        logger.info(query)
+        self.execute_command(query)
+
+    def table_exists(self, table_name) -> bool:
+        result = self.client.query(f'EXISTS TABLE `{self.database}`.`{table_name}`')
+        return bool(result.result_rows and result.result_rows[0][0])
+
+    def count_rows(self, table_name) -> int:
+        # The session runs with `final = 1`; force it off here or count() would
+        # do a full FINAL dedup pass. This is a cheap, informational part count.
+        result = self.client.query(f'SELECT count() FROM `{self.database}`.`{table_name}` SETTINGS final = 0')
+        return int(result.result_rows[0][0])
 
     def select(self, table_name, where=None, final=None):
         query = f'SELECT * FROM {table_name}'

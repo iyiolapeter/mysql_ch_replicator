@@ -22,6 +22,7 @@ class DbReplicatorRealtime:
     DATA_DUMP_INTERVAL = 1
     DATA_DUMP_BATCH_SIZE = 100000
     READ_LOG_INTERVAL = 0.3
+    CONTROL_POLL_INTERVAL = 1.0
 
     def __init__(self, replicator):
         self.replicator = replicator
@@ -29,6 +30,8 @@ class DbReplicatorRealtime:
         # Initialize internal state
         self.records_to_insert = defaultdict(dict)  # table_name => {record_id=>record, ...}
         self.records_to_delete = defaultdict(set)  # table_name => {record_id, ...}
+        self.last_control_poll_time = 0
+        self.control_last_error = None
         self.last_save_state_time = 0
         self.last_dump_stats_time = 0
         self.last_dump_stats_process_time = 0
@@ -51,6 +54,11 @@ class DbReplicatorRealtime:
         self.replicator.state.save()
         self.replicator.data_reader.set_position(self.replicator.state.last_processed_transaction)
 
+        if not self.replicator.is_parallel_worker:
+            # A live rebootstrap cannot survive a process restart - roll it back.
+            self.replicator.rebootstrap.recover_after_restart()
+            self.publish_control_status()
+
         killer = GracefulKiller()
 
         while not killer.kill_now:
@@ -59,6 +67,8 @@ class DbReplicatorRealtime:
                 if curr_time - self.start_time >= self.replicator.config.auto_restart_interval:
                     logger.info('process restart (check auto_restart_interval config option)')
                     break
+
+            self.handle_control_if_required()
 
             event = self.replicator.data_reader.read_next_event()
             if event is None:
@@ -90,7 +100,11 @@ class DbReplicatorRealtime:
             EventType.QUERY.value: self.handle_query_event,
         }
 
-        if not event.table_name or self.replicator.config.is_table_matches(event.table_name):
+        if event.table_name and event.table_name in self.replicator.skipped_tables:
+            # Live skip: the event is read (position advances) but not applied.
+            # QUERY/DDL events carry no table name, so DDL still applies.
+            self.replicator.stats.skipped_events_count += 1
+        elif not event.table_name or self.replicator.config.is_table_matches(event.table_name):
             event_handlers[event.event_type](event)
 
         self.replicator.stats.events_count += 1
@@ -109,6 +123,56 @@ class DbReplicatorRealtime:
         self.last_save_state_time = curr_time
         self.replicator.state.tables_last_record_version = self.replicator.clickhouse_api.tables_last_record_version
         self.replicator.state.save()
+
+    # ---- live control plane: skip / unskip / rebootstrap ---------------------
+    def handle_control_if_required(self):
+        if self.replicator.is_parallel_worker:
+            return
+        curr_time = time.time()
+        if curr_time - self.last_control_poll_time < self.CONTROL_POLL_INTERVAL:
+            return
+        self.last_control_poll_time = curr_time
+        for request in self.replicator.control.take_requests():
+            self.handle_control_request(request)
+        self.replicator.rebootstrap.poll()
+        self.publish_control_status()
+
+    def handle_control_request(self, request: dict):
+        op, table_name = request.get('op'), request.get('table')
+        logger.info(f'control request: {request}')
+        try:
+            if op == 'skip':
+                self.upload_records()
+                self.replicator.skipped_tables.add(table_name)
+            elif op == 'unskip':
+                self.replicator.ensure_table_structure(table_name)
+                self.replicator.skipped_tables.discard(table_name)
+                logger.warning(
+                    f'table {table_name} re-included: DML while it was skipped was NOT applied, '
+                    f'so its data is stale until a rebootstrap rebuilds it'
+                )
+            elif op == 'rebootstrap':
+                self.replicator.rebootstrap.start(table_name)
+            elif op == 'abort_rebootstrap':
+                self.replicator.rebootstrap.abort('requested by operator')
+            else:
+                raise Exception(f'unknown control op {op!r}')
+            self.control_last_error = None
+        except Exception as e:
+            logger.error(f'control request {request} failed: {e}', exc_info=True)
+            self.control_last_error = f'{op} {table_name}: {e}'
+        self.replicator.state.skipped_tables = list(self.replicator.skipped_tables)
+        self.replicator.state.save()
+
+    def publish_control_status(self):
+        self.replicator.control.write_status({
+            'pid': os.getpid(),
+            'position': self.replicator.state.last_processed_transaction,
+            'skipped_tables': sorted(self.replicator.skipped_tables),
+            'mirrors': dict(self.replicator.table_mirrors),
+            'rebootstrap': self.replicator.rebootstrap.status(),
+            'control_last_error': self.control_last_error,
+        })
 
     def _get_record_id(self, ch_table_structure, record: list):
         result = []
@@ -130,6 +194,7 @@ class DbReplicatorRealtime:
         self.replicator.stats.insert_events_count += 1
         self.replicator.stats.insert_records_count += len(event.records)
 
+        self.replicator.ensure_table_structure(event.table_name)
         mysql_table_structure = self.replicator.state.tables_structure[event.table_name][0]
         clickhouse_table_structure = self.replicator.state.tables_structure[event.table_name][1]
         records = self.replicator.converter.convert_records(event.records, mysql_table_structure, clickhouse_table_structure)
@@ -162,6 +227,7 @@ class DbReplicatorRealtime:
         self.replicator.stats.erase_events_count += 1
         self.replicator.stats.erase_records_count += len(event.records)
 
+        self.replicator.ensure_table_structure(event.table_name)
         table_structure_ch: TableStructure = self.replicator.state.tables_structure[event.table_name][1]
         table_structure_mysql: TableStructure = self.replicator.state.tables_structure[event.table_name][0]
 
@@ -364,6 +430,13 @@ class DbReplicatorRealtime:
             if self.replicator.config.debug_log_level:
                 logger.debug(f'inserting into {target_table_name}, records: {records}')
             self.replicator.clickhouse_api.insert(target_table_name, records, table_structure=ch_table_structure)
+            mirror_table_name = self.replicator.table_mirrors.get(table_name)
+            if mirror_table_name:
+                # rebootstrap in progress: keep the shadow current too, drawing
+                # versions from the live table's counter so they beat snapshot rows
+                self.replicator.clickhouse_api.insert(
+                    mirror_table_name, records, table_structure=ch_table_structure, version_key=target_table_name,
+                )
 
         for table_name, keys_to_remove in self.records_to_delete.items():
             if not keys_to_remove:
@@ -378,6 +451,13 @@ class DbReplicatorRealtime:
                 field_name=primary_key_names,
                 field_values=keys_to_remove,
             )
+            mirror_table_name = self.replicator.table_mirrors.get(table_name)
+            if mirror_table_name:
+                self.replicator.clickhouse_api.erase(
+                    table_name=mirror_table_name,
+                    field_name=primary_key_names,
+                    field_values=keys_to_remove,
+                )
 
         self.records_to_insert = defaultdict(dict)  # table_name => {record_id=>record, ...}
         self.records_to_delete = defaultdict(set)  # table_name => {record_id, ...}

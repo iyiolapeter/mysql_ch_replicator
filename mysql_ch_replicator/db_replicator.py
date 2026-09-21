@@ -12,6 +12,8 @@ from .converter import MysqlToClickhouseConverter
 from .binlog_replicator import DataReader
 from .db_replicator_initial import DbReplicatorInitial
 from .db_replicator_realtime import DbReplicatorRealtime
+from .rebootstrap import Rebootstrap
+from .control import ControlChannel
 from .common import Status
 
 
@@ -27,6 +29,7 @@ class Statistics:
     erase_events_count: int = 0
     erase_records_count: int = 0
     no_events_count: int = 0
+    skipped_events_count: int = 0
     cpu_load: float = 0.0
 
 
@@ -43,6 +46,10 @@ class State:
         self.tables_structure: dict = {}
         self.tables = []
         self.pid = None
+        # Tables whose binlog events are read but NOT applied (live skip).
+        self.skipped_tables = []
+        # In-progress live single-table rebootstrap (see rebootstrap.py), or None.
+        self.rebootstrap = None
         self.load()
 
     def load(self):
@@ -60,6 +67,8 @@ class State:
         self.tables_structure = data['tables_structure']
         self.tables = data['tables']
         self.pid = data.get('pid', None)
+        self.skipped_tables = data.get('skipped_tables', [])
+        self.rebootstrap = data.get('rebootstrap', None)
 
     def save(self):
         file_name = self.file_name
@@ -71,6 +80,8 @@ class State:
             'initial_replication_max_primary_key': self.initial_replication_max_primary_key,
             'tables_structure': self.tables_structure,
             'tables': self.tables,
+            'skipped_tables': list(self.skipped_tables),
+            'rebootstrap': self.rebootstrap,
             'pid': os.getpid(),
             'save_time': time.time(),
         })
@@ -89,7 +100,8 @@ class State:
 class DbReplicator:
     def __init__(self, config: Settings, database: str, target_database: str = None, initial_only: bool = False, 
                  worker_id: int = None, total_workers: int = None, table: str = None, 
-                 initial_replication_test_fail_records: int = None, skip_initial_replication: bool = False):
+                 initial_replication_test_fail_records: int = None, skip_initial_replication: bool = False,
+                 target_table: str = None, fixed_version: int = None):
         self.config = config
         self.database = database
         self.worker_id = worker_id
@@ -98,6 +110,16 @@ class DbReplicator:
         self.single_table = table  # Store the single table to process
         self.initial_replication_test_fail_records = initial_replication_test_fail_records  # Test flag for early exit
         self.skip_initial_replication = skip_initial_replication or config.skip_initial_replication
+        # Live single-table rebootstrap plumbing:
+        #  - target_table_override: a bulk-load worker (--table X) writes X's
+        #    rows into this ClickHouse table (the shadow) instead of X.
+        #  - fixed_version: that worker stamps every row with this _version.
+        #  - table_mirrors: in the main process, realtime writes for a source
+        #    table are ALSO applied to the mapped shadow table.
+        self.target_table_override = target_table
+        self.fixed_version = fixed_version
+        self.table_mirrors: dict[str, str] = {}
+        self.rebootstrap_last_error = None
         
         # use same as source database by default
         self.target_database = database
@@ -183,6 +205,7 @@ class DbReplicator:
         self.converter = MysqlToClickhouseConverter(self)
         self.data_reader = DataReader(config.binlog_replicator, database)
         self.state = self.create_state()
+        self.skipped_tables: set[str] = set(self.state.skipped_tables or [])
         self.clickhouse_api.tables_last_record_version = self.state.tables_last_record_version
         self.stats = Statistics()
         self.start_time = time.time()
@@ -193,11 +216,57 @@ class DbReplicator:
         # Create the realtime replicator instance
         self.realtime_replicator = DbReplicatorRealtime(self)
 
+        # Live control plane (skip/unskip/rebootstrap) + the rebootstrap driver.
+        self.control = ControlChannel(os.path.dirname(self.state_path))
+        self.rebootstrap = Rebootstrap(self)
+
     def create_state(self):
         return State(self.state_path)
 
-    def get_target_table_name(self, source_table: str) -> str:
+    def get_live_target_table_name(self, source_table: str) -> str:
+        """Configured target name only - never the shadow override."""
         return self.config.get_target_table_name(self.database, source_table)
+
+    def get_target_table_name(self, source_table: str) -> str:
+        if self.target_table_override and self.single_table == source_table:
+            return self.target_table_override
+        return self.get_live_target_table_name(source_table)
+
+    def get_mysql_api_lazy(self) -> MySQLApi:
+        """Realtime replication closes mysql_api; re-open on demand (used to
+        load a table's structure when it is (re)included at runtime and by
+        the live rebootstrap)."""
+        if self.mysql_api is None:
+            self.mysql_api = MySQLApi(
+                database=self.database,
+                mysql_settings=self.config.mysql,
+                mysql_timezone=self.config.mysql_timezone,
+            )
+        return self.mysql_api
+
+    def load_table_structure_from_mysql(self, table_name: str):
+        """(mysql_structure, clickhouse_structure) for table_name from the
+        CURRENT MySQL schema; the CH structure carries the live target name."""
+        create_statement = self.get_mysql_api_lazy().get_table_create_statement(table_name)
+        mysql_structure = self.converter.parse_mysql_table_structure(
+            create_statement, required_table_name=table_name,
+        )
+        clickhouse_structure = self.converter.convert_table_structure(mysql_structure)
+        clickhouse_structure.table_name = self.get_live_target_table_name(table_name)
+        return mysql_structure, clickhouse_structure
+
+    def ensure_table_structure(self, table_name: str):
+        """Make sure state.tables_structure knows table_name. Realtime handlers
+        index tables_structure directly, which raised KeyError for a table
+        re-included after being skipped (or added to the whitelist while the
+        replicator was already in realtime mode)."""
+        if table_name in self.state.tables_structure:
+            return
+        logger.info(f'loading structure for table {table_name} from MySQL (not in state)')
+        self.state.tables_structure[table_name] = self.load_table_structure_from_mysql(table_name)
+        if table_name not in self.state.tables:
+            self.state.tables.append(table_name)
+        self.state.save()
 
     def validate_database_settings(self):
         if not self.initial_only:

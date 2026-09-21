@@ -235,7 +235,10 @@ class DbReplicatorInitial:
             if not records:
                 break
             target_table_name = self.replicator.get_target_table_name(table_name)
-            self.replicator.clickhouse_api.insert(target_table_name, records, table_structure=clickhouse_table_structure)
+            self.replicator.clickhouse_api.insert(
+                target_table_name, records, table_structure=clickhouse_table_structure,
+                fixed_version=self.replicator.fixed_version,  # set only for rebootstrap workers
+            )
             for record in records:
                 record_primary_key = [record[key_idx] for key_idx in primary_key_ids]
                 if max_primary_key is None:
