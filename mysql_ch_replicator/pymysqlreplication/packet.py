@@ -1,8 +1,10 @@
+import datetime
+import decimal
+import json
 from . import constants, event, row_event
 from .json_binary import parse_json, JsonDiff, JsonDiffOperation
 from .util.bytes import *
 from .constants import BINLOG
-from .cpp_accelerated import cpp_mysql_to_json
 
 # Constants from PyMYSQL source code
 NULL_COLUMN = 251
@@ -14,6 +16,48 @@ UNSIGNED_CHAR_LENGTH = 1
 UNSIGNED_SHORT_LENGTH = 2
 UNSIGNED_INT24_LENGTH = 3
 UNSIGNED_INT64_LENGTH = 8
+
+
+def _json_default(value):
+    """json.dumps() hook for the Python types the pure parser can emit for
+    JSONB OPAQUE scalars (DECIMAL / DATE / TIME / DATETIME values that MySQL
+    stores typed when a JSON document is built from a typed column, e.g.
+    JSON_SET(doc, '$.amount', amount) with a DECIMAL column)."""
+    if isinstance(value, decimal.Decimal):
+        return int(value) if value == value.to_integral_value() else float(value)
+    if isinstance(value, (datetime.datetime, datetime.date, datetime.time)):
+        return value.isoformat()
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    return str(value)
+
+
+def _normalize_json_value(value):
+    """The pure parser returns JSON strings and object keys as bytes; make the
+    structure json.dumps()-able (keys must be str) and UTF-8 decoded."""
+    if isinstance(value, bytes):
+        return value.decode('utf-8', errors='replace')
+    if isinstance(value, dict):
+        return {_normalize_json_value(k): _normalize_json_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_value(v) for v in value]
+    return value
+
+
+def decode_binary_json(data: bytes) -> str:
+    """Decode a MySQL JSONB blob to a JSON text using the pure-Python parser.
+
+    The C++ accelerator (cpp_accelerated / libmysqljsonparse, loaded via
+    ctypes) does not implement JSONB_TYPE_OPAQUE and throws
+    std::runtime_error("invalid scalar type") for it; a C++ exception that
+    crosses a ctypes boundary cannot be caught in Python and terminates the
+    whole binlog_replicator process (SIGABRT). One backoffice UPDATE whose
+    JSON amount came from a DECIMAL column crash-looped production for 32h
+    (2026-11-07). The pure parser handles OPAQUE (decimal / time / datetime).
+    Returned as text so the converter passes it through unchanged.
+    """
+    value = _normalize_json_value(parse_json(data[0], data[1:]))
+    return json.dumps(value, default=_json_default, ensure_ascii=False, separators=(',', ':'))
 
 
 class BinLogPacketWrapper(object):
@@ -349,7 +393,7 @@ class BinLogPacketWrapper(object):
             # handle NULL value
             return None
         data = self.read(length)
-        return cpp_mysql_to_json(data).decode('utf-8')
+        return decode_binary_json(data)
 
         #
         # if is_partial:
