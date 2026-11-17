@@ -613,10 +613,21 @@ class MysqlToClickhouseConverter:
             if mysql_field_type.startswith('multipolygon'):
                 clickhouse_field_value = parse_mysql_multipolygon(clickhouse_field_value)
 
-            if mysql_field_type.startswith('enum('):
-                enum_values = mysql_structure.fields[idx].additional_data
-                field_name = mysql_structure.fields[idx].name if idx < len(mysql_structure.fields) else "unknown"
-                
+            if mysql_field_type.lower().startswith('enum('):
+                mysql_field = mysql_structure.fields[idx]
+                enum_values = mysql_field.additional_data
+                if enum_values is None:
+                    # Self-heal. Only parse_mysql_table_structure filled additional_data;
+                    # enum columns that went through a realtime ALTER (ADD / MODIFY /
+                    # CHANGE) were stored without their allowed values, so the first
+                    # non-NULL value raised "TypeError: object of type 'NoneType' has no
+                    # len()" and crash-looped db_replicator (__nudge_execution.status,
+                    # 2026-11-15, 10 weeks after the .12 MODIFY). Parse them from the
+                    # column type and persist on the field (state is pickled with it).
+                    enum_values = parse_mysql_enum(mysql_field.field_type)
+                    mysql_field.additional_data = enum_values
+                field_name = mysql_field.name
+
                 clickhouse_field_value = EnumConverter.convert_mysql_to_clickhouse_enum(
                     clickhouse_field_value,
                     enum_values,
@@ -816,6 +827,18 @@ class MysqlToClickhouseConverter:
 
             raise Exception(f'operation {op_name} not implement, query: {subquery}, full query: {mysql_query}')
 
+    @staticmethod
+    def _mysql_table_field(column_name: str, column_type_mysql: str) -> TableField:
+        """MySQL-side TableField for a column that arrives through ALTER, with
+        enum/set values filled in exactly like parse_mysql_table_structure does.
+        Leaving additional_data=None on an enum column makes convert_record
+        crash on the first non-NULL value."""
+        return TableField(
+            name=column_name,
+            field_type=column_type_mysql,
+            additional_data=extract_enum_or_set_values(column_type_mysql, from_parser_func=parse_mysql_enum),
+        )
+
     @classmethod
     def _tokenize_alter_query(cls, sql_line):
         # We want to recognize tokens that may be:
@@ -913,7 +936,7 @@ class MysqlToClickhouseConverter:
 
             if column_first:
                 mysql_table_structure.add_field_first(
-                    TableField(name=column_name, field_type=column_type_mysql)
+                    self._mysql_table_field(column_name, column_type_mysql)
                 )
                 
                 ch_table_structure.add_field_first(
@@ -924,7 +947,7 @@ class MysqlToClickhouseConverter:
                     column_after = strip_sql_name(mysql_table_structure.fields[-1].name)
 
                 mysql_table_structure.add_field_after(
-                    TableField(name=column_name, field_type=column_type_mysql),
+                    self._mysql_table_field(column_name, column_type_mysql),
                     column_after,
                 )
 
@@ -1036,7 +1059,7 @@ class MysqlToClickhouseConverter:
                 column_type_ch = self._merge_ch_enum(existing_field.field_type, column_type_ch)
 
             mysql_table_structure.update_field(
-                TableField(name=column_name, field_type=column_type_mysql),
+                self._mysql_table_field(column_name, column_type_mysql),
             )
 
             ch_table_structure.update_field(
@@ -1218,7 +1241,7 @@ class MysqlToClickhouseConverter:
             if current_column_type_ch != column_type_ch:
 
                 mysql_table_structure.update_field(
-                    TableField(name=column_name, field_type=column_type_mysql),
+                    self._mysql_table_field(column_name, column_type_mysql),
                 )
 
                 ch_table_structure.update_field(
